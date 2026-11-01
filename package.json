@@ -2,7 +2,7 @@
   "name": "dsh-agent-sdk-bridge",
   "displayName": "Agent SDK Bridge",
   "description": "DeepSeek Harness LLM adapter bridge for Qoder CN, Qoder International, Tencent CodeBuddy and MiniMax Code subscriptions. It reuses each provider's own SDK or official ACP server and CLI login, shows available quota, and exposes per-provider settings pages with independent international and mainland login regions.",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "type": "module",
   "license": "MIT",
   "author": "k1-h2",

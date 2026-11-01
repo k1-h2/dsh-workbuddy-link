@@ -282,12 +282,14 @@ export declare class CodeBuddySession {
      * compacts (and the gateway rejects) anything past 276K — while the host,
      * told 1M, keeps showing and feeding a larger history. Replaying that history
      * then collapses to a summary. Applying the same number the host divides by
-     * keeps the two in step; models that expose no choice reject it and keep
-     * their default.
+     * keeps the two in step; the adapter therefore sends a window for every model
+     * it knows about, not only the ones that advertise a choice — the mainland
+     * catalog declares no lengths anywhere and its physical `maxInputTokens` is a
+     * provider number the CLI is free to ignore when left to itself.
      *
-     * The CLI refuses to clear the override (`contextWindow must be a positive
-     * safe integer`), so the adapter sends the model's default instead when the
-     * page returns to "default".
+     * A rejected value keeps the CLI on its own default, which is the one case
+     * where the two denominators can still disagree; it is reported nowhere, so
+     * the host's figure stays the visible contract.
      */
     private applyContextWindow;
     /**

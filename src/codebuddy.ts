@@ -21,7 +21,7 @@ import type {
   CanUseTool, Message, RawLanguageModel, UserMessage,
 } from '@tencent-ai/agent-sdk'
 import type { CodeBuddyRegion } from './brand.ts'
-import { CodeBuddyStateStore, codeBuddyCliDir } from './codebuddy-state.ts'
+import { CodeBuddyStateStore, codeBuddyCliDir, withoutCredential } from './codebuddy-state.ts'
 import type { CodeBuddySavedUser } from './codebuddy-state.ts'
 import { jsonSchemaToShape } from './jsonschema.ts'
 import type { Live } from './live.ts'
@@ -218,10 +218,24 @@ function tokenFor(region: CodeBuddyRegion): string | undefined {
  *   pins the environment, so a fresh process always reads the right catalog.
  */
 function cliEnv(region: CodeBuddyRegion): { env: Record<string, string> } {
-  const env: Record<string, string> = { CODEBUDDY_CONFIG_DIR: codeBuddyCliDir(region) }
+  const env = cliDirEnv(region)
   const token = tokenFor(region)
   if (token !== undefined) env.CODEBUDDY_AUTH_TOKEN = token
   return { env }
+}
+
+/**
+ * The region's own CLI directory, with no credential attached.
+ *
+ * The login, logout and silent-token calls need this and nothing else: they
+ * must not carry a bearer token (login starts fresh, logout clears), but they
+ * absolutely must be scoped to one region. Without it they acted on the CLI's
+ * default `~/.codebuddy`, which both regions share — so signing in for one
+ * region overwrote the other's login, and `logout` for the region the page was
+ * showing left the credential of the other one standing.
+ */
+function cliDirEnv(region: CodeBuddyRegion): Record<string, string> {
+  return { CODEBUDDY_CONFIG_DIR: codeBuddyCliDir(region) }
 }
 
 /** Remember a bearer token in memory and on disk. */
@@ -448,12 +462,15 @@ export class CodeBuddyAccountReader {
 
   private async fetch(region: CodeBuddyRegion): Promise<CodeBuddyUsageSnapshot> {
     const at = Date.now()
-    // No saved credential means this region was explicitly signed out. Never
-    // probe the CLI here: it may hold the *other* region's single cached
-    // login, and adopting that account would misattribute it to this region.
-    if (tokenFor(region) === undefined) {
-      return { at, error: `${region === 'cn' ? 'CodeBuddy 国内版' : 'CodeBuddy 国际版'}尚未登录，请在页面顶部选择该区域并登录。` }
-    }
+    // Ask the CLI even when this region holds no credential of ours.
+    //
+    // Refusing here used to be the guard against adopting the *other* region's
+    // login: the CLI's default directory is shared, so a probe could answer with
+    // whichever account logged in last. Every call now runs inside this region's
+    // own directory, so the answer can only be this region's — and the refusal
+    // had become pure damage: any accident that dropped the local copy of a
+    // working token left the card saying "not signed in" for an account the CLI
+    // still had, with no path back short of a fresh browser login.
     try {
       const account = await readAccount(region, readLive(this.timeoutMs, CODEBUDDY_FETCH_TIMEOUT_MS))
       // An unauthenticated CLI answers with an empty object or an anonymous
@@ -470,7 +487,7 @@ export class CodeBuddyAccountReader {
         return { at, account, quota }
       } catch (quotaError) {
         const message = quotaError instanceof Error ? quotaError.message : String(quotaError)
-        if (isExpiredToken(message)) forgetToken(region)
+        if (isCredentialRejected(quotaError)) forgetToken(region)
         else codeBuddyState.patch(region, { quota: undefined, quotaError: message })
         return { at, account, quotaError: message }
       }
@@ -500,7 +517,9 @@ async function readAccount(region: CodeBuddyRegion, timeoutMs: number): Promise<
   })
   try {
     await withTimeout(q.connect(), timeoutMs)
-    return await withTimeout(q.accountInfo(), timeoutMs)
+    // The CLI's answer carries a bearer token beside the identity; it goes on
+    // to the settings page through `/usage`, so the credential comes off here.
+    return withoutCredential(await withTimeout(q.accountInfo(), timeoutMs)) ?? {}
   } finally {
     await q.return().catch(() => undefined)
   }
@@ -609,9 +628,14 @@ function formatLocalTime(date: Date): string {
 /**
  * A bearer token for the region, from a recent login or a silent SDK read.
  *
- * `authenticate` returns the CLI's existing account token without opening a
- * browser when the region is already signed in, so this stays a read. When it
- * is not signed in the call times out; callers treat that as "log in first".
+ * The silent read is the documented behaviour of `authenticate` — return the
+ * CLI's existing token instead of opening a browser when the region is signed
+ * in — but it did not work as measured: on a machine with a live CodeBuddy
+ * login it timed out for both regions, each in the shared default directory and
+ * in both per-region directories. So treat it as best effort, and never as a
+ * place to recover from: the copy this plugin saved is the only credential a
+ * session can count on, which is why dropping it used to read as "not signed
+ * in" even while the account still worked.
  */
 async function readBearerToken(region: CodeBuddyRegion): Promise<string> {
   const cached = tokenFor(region)
@@ -619,6 +643,10 @@ async function readBearerToken(region: CodeBuddyRegion): Promise<string> {
   const sdk = await loadCodeBuddySdk()
   const result = await withTimeout(sdk.unstable_v2_authenticate({
     environment: codeBuddyEnvironment(region),
+    // Scoped to this region's directory. Left out, the CLI answered from its
+    // shared default directory — whichever region had signed in last — and
+    // `rememberBearerToken` below then recorded *that* account as this region's.
+    env: cliDirEnv(region),
     timeout: 3000,
     onAuthUrl: () => {
       // A quota read must never pop a browser; the page owns login.
@@ -682,7 +710,7 @@ export async function fetchCodeBuddyQuota(
   const text = await response.text()
   if (!response.ok) {
     if (response.status === 401 || response.status === 403) {
-      throw new Error('CodeBuddy 登录已过期，请重新登录')
+      throw new CredentialRejectedError('CodeBuddy 登录已过期，请重新登录')
     }
     const detail = text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160)
     throw new Error(`CodeBuddy 额度接口返回 HTTP ${response.status}${detail === '' ? '' : `：${detail}`}`)
@@ -696,9 +724,33 @@ export async function fetchCodeBuddyQuota(
   return parseCodeBuddyQuota(payload)
 }
 
-/** Whether a quota failure means the stored credential is no longer usable. */
-function isExpiredToken(message: string): boolean {
-  return /401|403|登录已过期|unauthor|token/i.test(message)
+/**
+ * The credential this region holds was rejected by the endpoint.
+ *
+ * Thrown where the rejection is *known* — an explicit HTTP 401/403 — rather
+ * than inferred from the error text. Inferring it was the bug: the loose
+ * matcher below used to treat any failure whose message happened to contain
+ * "token", "401" inside a number, or an HTML body mentioning a token, as an
+ * expired login. It then dropped a working credential, and because a missing
+ * local token reads as "signed out", the page showed an account as not signed
+ * in while the CLI still had a usable login.
+ */
+class CredentialRejectedError extends Error {}
+
+/**
+ * Whether a quota failure genuinely means the credential no longer works.
+ *
+ * The typed error carries the CLI's own expiry sentence, which is also matched
+ * here because the message is ours, fixed, and not derived from server text.
+ * Everything else — a 5xx, a bad payload, a timeout, an unreachable endpoint —
+ * leaves the credential alone.
+ *
+ * @param error - whatever quota reading threw.
+ */
+function isCredentialRejected(error: unknown): boolean {
+  if (error instanceof CredentialRejectedError) return true
+  const message = error instanceof Error ? error.message : String(error)
+  return message === 'CodeBuddy 登录已过期，请重新登录'
 }
 
 /** Read quota, retrying once with a fresh token after an auth failure. */
@@ -709,8 +761,7 @@ async function readQuotaWithToken(region: CodeBuddyRegion): Promise<CodeBuddyQuo
   try {
     return await fetchCodeBuddyQuota(region, token)
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error)
-    if (!isExpiredToken(detail)) throw error
+    if (!isCredentialRejected(error)) throw error
     forgetToken(region)
     const renewed = await readBearerToken(region).catch((renewError: unknown) => {
       throw new Error(authErrorText(region, renewError))
@@ -768,7 +819,7 @@ export class CodeBuddyAuth {
     try {
       const sdk = await loadCodeBuddySdk()
       await withTimeout(
-        sdk.unstable_v2_logout({ environment: codeBuddyEnvironment(region) }),
+        sdk.unstable_v2_logout({ environment: codeBuddyEnvironment(region), env: cliDirEnv(region) }),
         CODEBUDDY_FETCH_TIMEOUT_MS,
       )
     } catch (error) {
@@ -796,14 +847,18 @@ export class CodeBuddyAuth {
       // it returns that token without ever calling `onAuthUrl`, so the click
       // looks dead and an expired credential survives forever. A login click
       // always means "open the browser", so drop the stored credential first.
+      // Both calls are scoped to this region's directory: the CLI's default
+      // directory is shared, so an unscoped logout here signed the *other*
+      // region out as a side effect of logging this one in.
       await withTimeout(
-        sdk.unstable_v2_logout({ environment: codeBuddyEnvironment(region) }),
+        sdk.unstable_v2_logout({ environment: codeBuddyEnvironment(region), env: cliDirEnv(region) }),
         LOGOUT_TIMEOUT_MS,
       ).catch(() => undefined)
       if (!this.current(run)) return
       bearerTokens.delete(region)
       const result = await sdk.unstable_v2_authenticate({
         environment: codeBuddyEnvironment(region),
+        env: cliDirEnv(region),
         timeout: LOGIN_TIMEOUT_MS,
         onAuthUrl: (state) => {
           // The bundled CLI opens the browser itself as part of the login
@@ -976,12 +1031,14 @@ export class CodeBuddySession {
    * compacts (and the gateway rejects) anything past 276K — while the host,
    * told 1M, keeps showing and feeding a larger history. Replaying that history
    * then collapses to a summary. Applying the same number the host divides by
-   * keeps the two in step; models that expose no choice reject it and keep
-   * their default.
+   * keeps the two in step; the adapter therefore sends a window for every model
+   * it knows about, not only the ones that advertise a choice — the mainland
+   * catalog declares no lengths anywhere and its physical `maxInputTokens` is a
+   * provider number the CLI is free to ignore when left to itself.
    *
-   * The CLI refuses to clear the override (`contextWindow must be a positive
-   * safe integer`), so the adapter sends the model's default instead when the
-   * page returns to "default".
+   * A rejected value keeps the CLI on its own default, which is the one case
+   * where the two denominators can still disagree; it is reported nowhere, so
+   * the host's figure stays the visible contract.
    */
   private async applyContextWindow(session: SessionImpl): Promise<void> {
     const window = this.contextWindow
@@ -992,7 +1049,8 @@ export class CodeBuddySession {
     try {
       await session.setConfig({ contextWindow: window })
     } catch {
-      // `Allowed: <none>` models have one fixed window; their default stands.
+      // Nothing selectable here, or the value was refused: the model's own
+      // default stands rather than failing the turn over a budget hint.
     }
   }
 

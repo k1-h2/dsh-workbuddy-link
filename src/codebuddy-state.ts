@@ -28,6 +28,24 @@ export interface CodeBuddySavedUser {
   userNickname: string
 }
 
+/**
+ * A stored account reading with its credential removed.
+ *
+ * The CLI's `accountInfo()` answer carries a bearer token, and older versions
+ * persisted that object whole — a second copy of the credential in a file that
+ * gets backed up and pasted into bug reports, one the plugin never read. A
+ * region holds exactly one credential, in `token`.
+ */
+export function withoutCredential(account: CodeBuddyAccount | undefined): CodeBuddyAccount | undefined {
+  if (account === undefined) return undefined
+  const clean: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(account as Record<string, unknown>)) {
+    if (/token|secret|credential|password|cookie/i.test(key)) continue
+    clean[key] = value
+  }
+  return clean as CodeBuddyAccount
+}
+
 /** Everything remembered for one login region. */
 export interface CodeBuddySavedRegion {
   /** Bearer credential from the SDK login, used to restore the login. */
@@ -93,11 +111,43 @@ export class CodeBuddyStateStore {
       const parsed = JSON.parse(readFileSync(this.file, 'utf8')) as Partial<SavedFile>
       if (parsed.version === 1 && parsed.regions !== null && typeof parsed.regions === 'object') {
         this.state = { version: 1, regions: parsed.regions }
+        this.recoverLostTokens()
       }
     } catch {
       // A missing or unreadable file is the normal first-run state.
     }
     return this.state
+  }
+
+  /**
+   * Lift a credential the old layout hid inside the account object.
+   *
+   * The CLI's `accountInfo()` answer carries a bearer token of its own, and an
+   * earlier version persisted that whole object here. When the top-level
+   * `token` was later dropped — which any quota failure used to do, because
+   * expiry was *guessed* from the error text — the region read as signed out
+   * even though a working credential still sat in the file, and nothing could
+   * recover it without a fresh browser login. This picks the copy back up.
+   *
+   * {@link persist} no longer stores a token inside the account, so this runs
+   * only over files written by those older versions.
+   */
+  private recoverLostTokens(): void {
+    let recovered = false
+    for (const [key, saved] of Object.entries(this.state.regions)) {
+      const region = key as CodeBuddyRegion
+      const hidden = (saved?.account as { token?: unknown } | undefined)?.token
+      if (saved === undefined || saved.token !== undefined) continue
+      if (typeof hidden !== 'string' || hidden.length === 0) continue
+      this.state.regions[region] = {
+        ...saved,
+        token: hidden,
+        signedIn: true,
+        account: withoutCredential(saved.account),
+      }
+      recovered = true
+    }
+    if (recovered) this.persist()
   }
 
   region(region: CodeBuddyRegion): CodeBuddySavedRegion | undefined {
@@ -138,6 +188,9 @@ export class CodeBuddyStateStore {
       if (value === undefined) delete next[key as keyof CodeBuddySavedRegion]
       else (next as Record<string, unknown>)[key] = value
     }
+    // The account object arrives from the CLI carrying a bearer token of its
+    // own; keep exactly one credential per region on disk.
+    if (next.account !== undefined) next.account = withoutCredential(next.account)
     state.regions[region] = next
     this.persist()
   }

@@ -20,6 +20,15 @@ export interface CodeBuddySavedUser {
     userName: string;
     userNickname: string;
 }
+/**
+ * A stored account reading with its credential removed.
+ *
+ * The CLI's `accountInfo()` answer carries a bearer token, and older versions
+ * persisted that object whole — a second copy of the credential in a file that
+ * gets backed up and pasted into bug reports, one the plugin never read. A
+ * region holds exactly one credential, in `token`.
+ */
+export declare function withoutCredential(account: CodeBuddyAccount | undefined): CodeBuddyAccount | undefined;
 /** Everything remembered for one login region. */
 export interface CodeBuddySavedRegion {
     /** Bearer credential from the SDK login, used to restore the login. */
@@ -50,6 +59,20 @@ export declare class CodeBuddyStateStore {
     private state;
     constructor(file?: string);
     private ensureLoaded;
+    /**
+     * Lift a credential the old layout hid inside the account object.
+     *
+     * The CLI's `accountInfo()` answer carries a bearer token of its own, and an
+     * earlier version persisted that whole object here. When the top-level
+     * `token` was later dropped — which any quota failure used to do, because
+     * expiry was *guessed* from the error text — the region read as signed out
+     * even though a working credential still sat in the file, and nothing could
+     * recover it without a fresh browser login. This picks the copy back up.
+     *
+     * {@link persist} no longer stores a token inside the account, so this runs
+     * only over files written by those older versions.
+     */
+    private recoverLostTokens;
     region(region: CodeBuddyRegion): CodeBuddySavedRegion | undefined;
     /** The stored bearer token, or undefined when the region is signed out. */
     token(region: CodeBuddyRegion): string | undefined;
